@@ -1,38 +1,52 @@
 import argparse
 import json
 import os
+import re
 import requests
 import pathlib
 import shutil
 import yaml
 from jinja2 import Environment, FileSystemLoader
+import functools
 
 root = pathlib.Path(__file__).parent
 
-cache = root.joinpath('cache')
-cache.mkdir(exist_ok=True)
-cache.joinpath('repos').mkdir(exist_ok=True)
 
-config_file = root.joinpath('config.yaml')
-with open(config_file) as fh:
-    config = yaml.load(fh, Loader=yaml.Loader)
+@functools.cache
+def cache():
+    cache_dir_str = os.environ.get('OSBO_CACHE')
+    cache_dir = pathlib.Path(cache_dir_str) if cache_dir_str else root.joinpath('cache')
+    cache_dir.mkdir(exist_ok=True)
+    cache_dir.joinpath('repos').mkdir(exist_ok=True)
+    return cache_dir
 
-locations = dict({ display_name.lower().replace(' ', '-') : display_name  for display_name in config['countries']})
+
+@functools.cache
+def config():
+    config_file = root.joinpath('config.yaml')
+    with open(config_file) as fh:
+        conf = yaml.load(fh, Loader=yaml.Loader)
+    return conf
+
+@functools.cache
+def locations():
+    return dict({ display_name.lower().replace(' ', '-') : display_name  for display_name in config()['countries']})
 
 
 def render(template, filename, **args):
     templates_dir = pathlib.Path(__file__).parent.joinpath('templates')
     env = Environment(loader=FileSystemLoader(templates_dir), autoescape=True)
     html_template = env.get_template(template)
-    html_content = html_template.render(**args, org_types=config['org_types'], locations=locations)
+    html_content = html_template.render(**args, org_types=config()['org_types'], locations=locations())
     with open(filename, 'w') as fh:
         fh.write(html_content)
 
 
 def read_organisations(root):
     organisations = {}
-    for yaml_file in root.joinpath('organisations').iterdir():
-        if yaml_file.suffix != '.yaml':
+    org_path = os.environ.get('OSBO_ORG', root.joinpath('data', 'organisations'))
+    for yaml_file in org_path.iterdir():
+        if not re.search(r'^[a-z.-]+\.yaml', yaml_file.parts[-1]):
             exit(f"Invalid file name {yaml_file}")
         with open(yaml_file) as fh:
             data = yaml.load(fh, Loader=yaml.Loader)
@@ -46,10 +60,12 @@ def read_github_organisations(root, files, organisations):
         for file in files:
             pathes.append(pathlib.Path(file))
     else:
-        pathes = root.joinpath('github').iterdir()
+        github_path_str = os.environ.get('OSBO_GITHUB')
+        github_path = pathlib.Path(github_path_str) if github_path_str else root.joinpath('data', 'github')
+        pathes = github_path.iterdir()
     github_organisations = []
     for yaml_file in pathes:
-        if yaml_file.suffix != '.yaml':
+        if not re.search(r'^[a-z0-9-]+\.yaml', yaml_file.parts[-1]):
             exit(f"Invalid file name {yaml_file}")
         # print(yaml_file)
         with open(yaml_file) as fh:
@@ -70,7 +86,7 @@ def read_github_organisations(root, files, organisations):
 
         if not 'type' in data:
             exit(f'type is missing from {yaml_file}')
-        if data['type'] not in config['org_types'].keys():
+        if data['type'] not in config()['org_types'].keys():
             exit(f"Invalid type '{data['type']}' in {yaml_file}")
         if not 'name' in data:
             exit(f'name is missing from {yaml_file}')
@@ -79,7 +95,7 @@ def read_github_organisations(root, files, organisations):
         data['id'] = yaml_file.parts[-1].replace('.yaml', '')
 
         if 'country' in data:
-            if data['country'] not in config['countries']:
+            if data['country'] not in config()['countries']:
                 exit(f"Country '{data['country']}'  in {yaml_file} is not in our approved list. Either add it to config.yaml or fix the name if it is a different spelling.")
         #print(data)
         github_organisations.append(data)
@@ -130,7 +146,7 @@ def get_data_from_github(github_organisations):
 
     for org in github_organisations:
         # print(org['id'])
-        cache_file = cache.joinpath(org['id'].lower() + '.json')
+        cache_file = cache().joinpath(org['id'].lower() + '.json')
         if not cache_file.exists():
             data = get_from_github(f"https://api.github.com/orgs/{org['id']}", cache_file)
             if data is not None and data.get('message', '') == 'Not Found':
@@ -142,12 +158,16 @@ def get_data_from_github(github_organisations):
             with cache_file.open() as fh:
                 org['github'] = json.load(fh)
 
+        if 'github' not in org:
+            print("github not in org data")
+            continue
+
         if org['github'].get('message', '') == "Not Found":
             print(f"Not Found {org['id']}")
             continue
 
         # Get list of repos
-        cache_file = cache.joinpath('repos', org['id'].lower() + '.json')
+        cache_file = cache().joinpath('repos', org['id'].lower() + '.json')
         if not cache_file.exists():
             data = get_from_github(f"https://api.github.com/orgs/{org['id']}/repos", cache_file, expected=org['github']['public_repos'], pages=True)
             if data is not None and data == ['message', 'documentation_url']:
@@ -162,7 +182,8 @@ def get_data_from_github(github_organisations):
 
 
 def generate_html_pages(github_organisations):
-    out_dir = root.joinpath("_site")
+    out_dir_str = os.environ.get('OSBO_SITE')
+    out_dir = pathlib.Path(out_dir_str) if out_dir_str else root.joinpath("_site")
     out_dir.mkdir(exist_ok=True)
 
     ci = os.environ.get('CI')
@@ -187,7 +208,7 @@ def generate_html_pages(github_organisations):
         'by_type': {}
     }
 
-    for org_type, display_name in config['org_types'].items():
+    for org_type, display_name in config()['org_types'].items():
         organisations = [org for org in github_organisations if org['type'] == org_type]
         stats['by_type'][org_type] = len(organisations)
         render('list.html', out_dir.joinpath(f'{org_type}.html'),
@@ -196,7 +217,7 @@ def generate_html_pages(github_organisations):
         )
 
     out_dir.joinpath("loc").mkdir(exist_ok=True)
-    for path, display_name in locations.items():
+    for path, display_name in locations().items():
         render('list.html', out_dir.joinpath('loc', f'{path}.html'),
             github_organisations = [org for org in github_organisations if org.get('country', '') == display_name],
             title = f'Open Source in {display_name}',
@@ -225,5 +246,6 @@ def main():
 
     generate_html_pages(github_organisations)
 
+if __name__ == "__main__":
+    main()
 
-main()
